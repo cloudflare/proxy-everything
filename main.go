@@ -242,7 +242,6 @@ func entrypoint(ctx context.Context) {
 	config := net.ListenConfig{
 		Control: func(network string, addr string, conn syscall.RawConn) error {
 			return conn.Control(func(fd uintptr) {
-				fmt.Println("called setsock")
 				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
 					fatal(fmt.Errorf("setsockoptint: %w", err))
 				}
