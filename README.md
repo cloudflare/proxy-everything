@@ -173,5 +173,11 @@ if err := syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT,
 
 The above can work for both IPv4 and IPv6.
 
-## How you can implement
 
+
+----
+
+Thank you to `upx` contributors and authors, it makes `proxy-everything` live as a very tiny image
+that can be pulled and ran very quickly.
+
+https://linux.die.net/man/1/upx
