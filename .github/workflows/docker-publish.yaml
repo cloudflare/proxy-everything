@@ -32,6 +32,12 @@ jobs:
         uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81
         with:
           images: cloudflare/proxy-everything
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch
+            type=sha,prefix=,format=short,enable=${{ github.ref_type != 'tag' }}
+        env:
+          DOCKER_METADATA_SHORT_SHA_LENGTH: 7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,15 +12,41 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"sync"
 	"syscall"
-
-	"github.com/google/nftables"
-	"github.com/google/nftables/expr"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
+
+func runCommand(ctx context.Context, cmd ...string) error {
+	rest := func() []string {
+		if len(cmd) > 1 {
+			return cmd[1:]
+		}
+
+		return nil
+	}
+
+	command := exec.CommandContext(ctx, cmd[0], rest()...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		return fmt.Errorf("running command: %v: %w", string(output), err)
+	}
+
+	return nil
+
+}
+
+func mustRunCommand(ctx context.Context, cmd ...string) {
+	err := runCommand(ctx, cmd...)
+	if err != nil {
+		fatal(err)
+	}
+}
 
 func lookupDockerIPv4(ctx context.Context) (net.IP, error) {
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", "host.docker.internal")
@@ -41,282 +66,29 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-const nftTableName = "proxy_anything"
+const iptablesNamespace = "DOCKER_PROXY_ANYTHING"
 
-// cleanupNftables removes our nftables table and policy routing rules.
-// Errors are silently ignored to support idempotent restarts.
-func cleanupNftables() {
-	nftConn, err := nftables.New()
-	if err != nil {
-		return
+const iptablesNamespaceTproxy = iptablesNamespace + "_TPROXY"
+
+func cleanupIptables(ctx context.Context) {
+	// Ignore errors during cleanup
+	for _, iptables := range []string{"iptables", "ip6tables"} {
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesNamespace)
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesNamespaceTproxy)
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-m", "socket", "-j", "DIVERT")
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesNamespace)
+		runCommand(ctx, iptables, "-t", "mangle", "-F", "DIVERT")
+		runCommand(ctx, iptables, "-t", "mangle", "-X", "DIVERT")
+		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespace)
+		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespace)
+		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceTproxy)
+		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespaceTproxy)
 	}
 
-	for _, family := range []nftables.TableFamily{nftables.TableFamilyIPv4, nftables.TableFamilyIPv6} {
-		nftConn.DelTable(&nftables.Table{Name: nftTableName, Family: family})
+	for _, version := range []string{"-4", "-6"} {
+		runCommand(ctx, "ip", version, "rule", "del", "fwmark", "1", "table", "100")
+		runCommand(ctx, "ip", version, "route", "del", "local", "default", "dev", "lo", "table", "100")
 	}
-	_ = nftConn.Flush()
-
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		rules, err := netlink.RuleList(family)
-		if err != nil {
-			continue
-		}
-		for _, rule := range rules {
-			if rule.Mark == 1 && rule.Table == 100 {
-				_ = netlink.RuleDel(&rule)
-			}
-		}
-
-		lo, err := netlink.LinkByName("lo")
-		if err != nil {
-			continue
-		}
-		var dst *net.IPNet
-		if family == netlink.FAMILY_V4 {
-			dst = &net.IPNet{IP: net.IP{0, 0, 0, 0}, Mask: net.CIDRMask(0, 32)}
-		} else {
-			dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
-		}
-		_ = netlink.RouteDel(&netlink.Route{
-			LinkIndex: lo.Attrs().Index,
-			Dst:       dst,
-			Table:     100,
-			Type:      unix.RTN_LOCAL,
-		})
-	}
-}
-
-// setupPolicyRouting sets up: ip rule add fwmark 1 table 100
-// and: ip route add local default dev lo table 100
-func setupPolicyRouting(family int) error {
-	rule := netlink.NewRule()
-	rule.Family = family
-	rule.Table = 100
-	rule.Mark = 1
-	mask := uint32(0xFFFFFFFF)
-	rule.Mask = &mask
-	if err := netlink.RuleAdd(rule); err != nil {
-		return fmt.Errorf("rule add fwmark 1 table 100 (family %d): %w", family, err)
-	}
-
-	lo, err := netlink.LinkByName("lo")
-	if err != nil {
-		return fmt.Errorf("looking up lo: %w", err)
-	}
-
-	// Equivalent: ip route add local default dev lo table 100
-	// RTN_LOCAL requires RT_SCOPE_HOST, otherwise the kernel rejects it.
-	// Must use To4(), as net.IPv4zero is interpreted as a valid IPv6.
-	var dst *net.IPNet
-	if family == netlink.FAMILY_V4 {
-		dst = &net.IPNet{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)}
-	} else {
-		dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
-	}
-	if err := netlink.RouteAdd(&netlink.Route{
-		LinkIndex: lo.Attrs().Index,
-		Dst:       dst,
-		Scope:     netlink.SCOPE_HOST,
-		Table:     100,
-		Type:      unix.RTN_LOCAL,
-	}); err != nil {
-		return fmt.Errorf("route add local default dev lo table 100 (family %d): %w", family, err)
-	}
-
-	return nil
-}
-
-type nftSetupConfig struct {
-	family          nftables.TableFamily
-	ignoreAddresses []string
-	proxy           *proxy
-}
-
-// setupNftables configures TPROXY interception via nftables:
-//   - "prerouting" chain: divert existing sockets, skip ignored CIDRs, tproxy new TCP
-//   - "output" chain (type route): mark egress TCP with fwmark 1 for policy re-routing
-func setupNftables(configs []nftSetupConfig) error {
-	nftConn, err := nftables.New()
-	if err != nil {
-		return fmt.Errorf("nftables connection: %w", err)
-	}
-
-	for _, cfg := range configs {
-		table := nftConn.AddTable(&nftables.Table{
-			Name:   nftTableName,
-			Family: cfg.family,
-		})
-
-		// Single prerouting chain. The socket-transparent rule acts as the "divert":
-		// packets with an existing transparent socket get marked and accepted before
-		// reaching the tproxy rule. Unlike iptables, nftables accept in a base chain
-		// does NOT skip other base chains at the same hook, so everything must be in
-		// one chain for accept to work as an early-exit.
-		prerouting := nftConn.AddChain(&nftables.Chain{
-			Name:     "prerouting",
-			Table:    table,
-			Type:     nftables.ChainTypeFilter,
-			Hooknum:  nftables.ChainHookPrerouting,
-			Priority: nftables.ChainPriorityRef(nftables.ChainPriority(-150)), // mangle
-		})
-
-		// iptables equivalent: -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
-		// where DIVERT does: -j MARK --set-mark 1 then -j ACCEPT
-		nftConn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: prerouting,
-			Exprs: []expr.Any{
-				&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-				&expr.Socket{Key: expr.SocketKeyTransparent, Register: 1},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: uint32ToBytes(1)},
-				&expr.Immediate{Register: 1, Data: uint32ToBytes(1)},
-				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1, SourceRegister: true},
-				&expr.Verdict{Kind: expr.VerdictAccept},
-			},
-		})
-
-		// iptables equivalent: -t mangle -A <chain> -d <cidr> -j RETURN
-		for _, cidr := range cfg.ignoreAddresses {
-			_, ipNet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				return fmt.Errorf("parsing CIDR %s: %w", cidr, err)
-			}
-
-			nftConn.AddRule(&nftables.Rule{
-				Table: table,
-				Chain: prerouting,
-				Exprs: matchDestCIDR(cfg.family, ipNet, &expr.Verdict{Kind: expr.VerdictReturn}),
-			})
-		}
-
-		// iptables equivalent: -t mangle -A <chain> -m mark --mark 100 -p tcp -j RETURN
-		nftConn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: prerouting,
-			Exprs: matchMark(100, &expr.Verdict{Kind: expr.VerdictReturn}),
-		})
-
-		// iptables equivalent: -t mangle -A <chain> -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port PORT --on-ip IP
-		nftConn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: prerouting,
-			Exprs: buildTproxyExprs(cfg.family, cfg.proxy.addr),
-		})
-
-		// iptables equivalent: -t mangle OUTPUT chain
-		// type "route" triggers re-routing after mark is set, like mangle OUTPUT in iptables.
-		output := nftConn.AddChain(&nftables.Chain{
-			Name:     "output",
-			Table:    table,
-			Type:     nftables.ChainTypeRoute,
-			Hooknum:  nftables.ChainHookOutput,
-			Priority: nftables.ChainPriorityRef(nftables.ChainPriority(-150)),
-		})
-
-		for _, cidr := range cfg.ignoreAddresses {
-			_, ipNet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				return fmt.Errorf("parsing CIDR %s: %w", cidr, err)
-			}
-
-			nftConn.AddRule(&nftables.Rule{
-				Table: table,
-				Chain: output,
-				Exprs: matchDestCIDR(cfg.family, ipNet, &expr.Verdict{Kind: expr.VerdictReturn}),
-			})
-		}
-
-		nftConn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: output,
-			Exprs: matchMark(100, &expr.Verdict{Kind: expr.VerdictReturn}),
-		})
-
-		// iptables equivalent: -t mangle -A <chain> -j MARK --set-mark 1
-		nftConn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: output,
-			Exprs: []expr.Any{
-				&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-				&expr.Immediate{Register: 1, Data: uint32ToBytes(1)},
-				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1, SourceRegister: true},
-			},
-		})
-	}
-
-	if err := nftConn.Flush(); err != nil {
-		return fmt.Errorf("nftables flush: %w", err)
-	}
-
-	return nil
-}
-
-// matchMark matches tcp packets with the given fwmark and applies a verdict.
-func matchMark(mark uint32, verdict *expr.Verdict) []expr.Any {
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: uint32ToBytes(mark)},
-		verdict,
-	}
-}
-
-func matchDestCIDR(family nftables.TableFamily, ipNet *net.IPNet, verdict *expr.Verdict) []expr.Any {
-	var offset, length uint32
-	if family == nftables.TableFamilyIPv4 {
-		offset = 16 // IPv4 dst addr offset
-		length = 4
-	} else {
-		offset = 24 // IPv6 dst addr offset
-		length = 16
-	}
-
-	ip := ipNet.IP
-	mask := ipNet.Mask
-	if family == nftables.TableFamilyIPv4 {
-		ip = ip.To4()
-	}
-
-	return []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: length},
-		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: length, Mask: []byte(mask), Xor: make([]byte, length)},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte(ip.Mask(mask))},
-		verdict,
-	}
-}
-
-func buildTproxyExprs(family nftables.TableFamily, addr *net.TCPAddr) []expr.Any {
-	var nfproto uint32
-	var addrBytes []byte
-	if family == nftables.TableFamilyIPv4 {
-		nfproto = uint32(unix.NFPROTO_IPV4)
-		addrBytes = addr.IP.To4()
-	} else {
-		nfproto = uint32(unix.NFPROTO_IPV6)
-		addrBytes = addr.IP.To16()
-	}
-
-	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, uint16(addr.Port))
-
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-		&expr.Immediate{Register: 1, Data: addrBytes},
-		&expr.Immediate{Register: 2, Data: portBytes},
-		&expr.TProxy{Family: byte(nfproto), TableFamily: byte(nfproto), RegAddr: 1, RegPort: 2},
-		&expr.Immediate{Register: 1, Data: uint32ToBytes(1)},
-		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1, SourceRegister: true},
-	}
-}
-
-func uint32ToBytes(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.NativeEndian.PutUint32(b, v)
-	return b
 }
 
 func rstTCPConnection(conn net.Conn) error {
@@ -560,30 +332,92 @@ func entrypoint(ctx context.Context) {
 
 	fmt.Printf("Proxy address: %s, Port: %d\n", proxyAnythingAddressTCP.IP.String(), proxyAnythingAddressTCP.Port)
 
-	cleanupNftables()
+	cleanupIptables(ctx)
 
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		if err := setupPolicyRouting(family); err != nil {
-			fatal(err)
-		}
+	type ipTablesSetup struct {
+		ipTablesCmd     string
+		ipVersion       string
+		ignoreAddresses []string
+		proxy           *proxy
 	}
 
-	nftConfigs := []nftSetupConfig{
+	ipTablesSetupList := []ipTablesSetup{
 		{
-			family:          nftables.TableFamilyIPv4,
+			ipTablesCmd:     "iptables",
+			ipVersion:       "-4",
 			ignoreAddresses: []string{"127.0.0.1/8", *dockerGatewayCidr},
 			proxy:           proxies[0],
 		},
 		{
-			family:          nftables.TableFamilyIPv6,
+			ipTablesCmd:     "ip6tables",
+			ipVersion:       "-6",
 			ignoreAddresses: []string{"::1/128"},
 			proxy:           proxies[1],
 		},
 	}
 
-	if err := setupNftables(nftConfigs); err != nil {
-		fatal(err)
+	for _, iptablesSetup := range ipTablesSetupList {
+		iptables := iptablesSetup.ipTablesCmd
+
+		// 0. Set up routing for marked packets
+		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "rule", "add", "fwmark", "1", "table", "100")
+		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "route", "add", "local", "default", "dev", "lo", "table", "100")
+
+		// 1. Create the DIVERT chain in the mangle table
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-N", "DIVERT")
+
+		// 2. Set the routing mark (1) for packets entering this chain
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "DIVERT", "-j", "MARK", "--set-mark", "1")
+
+		// 3. Accept the packet (stop further processing in the mangle table for these packets)
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "DIVERT", "-j", "ACCEPT")
+
+		// 4. In PREROUTING, check if there is an existing socket for this TCP packet.
+		// If yes, send it to the DIVERT chain.
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "PREROUTING", "-p", "tcp", "-m", "socket", "-j", "DIVERT")
+
+		const iptablesNamespaceTproxy = iptablesNamespace + "_TPROXY"
+
+		// 5. Setup the TPROXY rules in our namespace
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-N", iptablesNamespaceTproxy)
+
+		// ensure the chain starts empty before adding rules
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceTproxy)
+
+		for _, cidrToIgnore := range iptablesSetup.ignoreAddresses {
+			mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceTproxy, "-d", cidrToIgnore, "-j", "RETURN")
+		}
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceTproxy, "-m", "mark", "-p", "tcp", "--mark", "100", "-j", "RETURN")
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceTproxy, "-p", "tcp", "-j", "TPROXY", "--tproxy-mark", "0x1/0x1", "--on-port",
+			strconv.Itoa(iptablesSetup.proxy.addr.Port), "--on-ip", iptablesSetup.proxy.addr.IP.String())
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesNamespaceTproxy)
+
+		// 6. Now time to do the new namespace for local rules, we will mark all matching egress with 0x1
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-N", iptablesNamespace)
+
+		// ensure the chain starts empty before adding rules
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespace)
+
+		for _, cidrToIgnore := range iptablesSetup.ignoreAddresses {
+			mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespace, "-d", cidrToIgnore, "-j", "RETURN")
+		}
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespace, "-m", "mark", "-p", "tcp", "--mark", "100", "-j", "RETURN")
+
+		// mark it so it's processed by loopback by the table 100
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespace, "-j", "MARK", "--set-mark", "1")
+
+		// Everything that tries to egress, process through the iptablesNamespace
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesNamespace)
+
+		// flush the cache
+		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "route", "flush", "cache")
 	}
+
+	// TODO: IPv6
 
 	wg := &sync.WaitGroup{}
 	for _, proxy := range proxies {
