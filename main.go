@@ -210,6 +210,8 @@ var egressPort *int = flag.Int("http-egress-port", 49121, "the port where the ga
 var proxyAnythingAddress *string = flag.String("address", "127.0.0.3:41209", "default address that proxy-everything will intercept traffic in")
 var proxyAnythingV6Address *string = flag.String("address-v6", "[::1]:41209", "default address that proxy-everything will intercept traffic in ipv6")
 var dockerGatewayCidr *string = flag.String("docker-gateway-cidr", "172.17.0.0/16", "the docker gateway to be used")
+var disableIPv6 *bool = flag.Bool("disable-ipv6", false, "disable ipv6 if not necessary")
+var gatewayIP *string = flag.String("gateway-ip", "", "set to override looking up the host-gateway")
 
 type proxy struct {
 	addr       *net.TCPAddr
@@ -291,9 +293,19 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func entrypoint(ctx context.Context) {
-	ip, err := lookupDockerIPv4(ctx)
+	dockerGatewayIP, err := lookupDockerIPv4(ctx)
 	if err != nil {
 		fatal(err)
+	}
+
+	var gatewayIPResolved net.IP = nil
+	if *gatewayIP != "" {
+		gatewayIPResolved = net.ParseIP(*gatewayIP)
+	}
+
+	egressIP := dockerGatewayIP
+	if gatewayIPResolved != nil {
+		egressIP = gatewayIPResolved
 	}
 
 	// unused for now but indicates future feature work
@@ -301,7 +313,7 @@ func entrypoint(ctx context.Context) {
 
 	flag.Parse()
 
-	egressAddress, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(*egressPort)))
+	egressAddress, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(egressIP.String(), strconv.Itoa(*egressPort)))
 	if err != nil {
 		fatal(err)
 	}
@@ -309,10 +321,6 @@ func entrypoint(ctx context.Context) {
 	_, dockerNetwork, err := net.ParseCIDR(*dockerGatewayCidr)
 	if err != nil {
 		fatal(err)
-	}
-
-	if !dockerNetwork.Contains(egressAddress.IP.To4()) {
-		fatal(fmt.Errorf("docker network %v does not contain resolved egress address %v", dockerNetwork, egressAddress))
 	}
 
 	proxyAnythingAddressTCP, err := net.ResolveTCPAddr("tcp4", *proxyAnythingAddress)
@@ -327,7 +335,11 @@ func entrypoint(ctx context.Context) {
 
 	proxies := []*proxy{
 		newProxy(ctx, proxyAnythingAddressTCP, egressAddress),
-		newProxy(ctx, proxyAnythingAddressV6TCP, egressAddress),
+	}
+
+	if !*disableIPv6 {
+		proxies = append(proxies,
+			newProxy(ctx, proxyAnythingAddressV6TCP, egressAddress))
 	}
 
 	fmt.Printf("Proxy address: %s, Port: %d\n", proxyAnythingAddressTCP.IP.String(), proxyAnythingAddressTCP.Port)
@@ -345,15 +357,18 @@ func entrypoint(ctx context.Context) {
 		{
 			ipTablesCmd:     "iptables",
 			ipVersion:       "-4",
-			ignoreAddresses: []string{"127.0.0.1/8", *dockerGatewayCidr},
+			ignoreAddresses: []string{"127.0.0.1/8", dockerNetwork.String(), egressIP.String() + "/24"},
 			proxy:           proxies[0],
 		},
-		{
+	}
+
+	if !*disableIPv6 {
+		ipTablesSetupList = append(ipTablesSetupList, ipTablesSetup{
 			ipTablesCmd:     "ip6tables",
 			ipVersion:       "-6",
 			ignoreAddresses: []string{"::1/128"},
 			proxy:           proxies[1],
-		},
+		})
 	}
 
 	for _, iptablesSetup := range ipTablesSetupList {
@@ -416,8 +431,6 @@ func entrypoint(ctx context.Context) {
 		// flush the cache
 		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "route", "flush", "cache")
 	}
-
-	// TODO: IPv6
 
 	wg := &sync.WaitGroup{}
 	for _, proxy := range proxies {
