@@ -292,6 +292,36 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 
 }
 
+func networkDeviceCIDRs() (ipv4 []string, ipv6 []string, err error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing network interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			cidr := addr.String() // already in CIDR notation (e.g. "10.0.0.1/24")
+			ip, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+
+			if ip.To4() != nil {
+				ipv4 = append(ipv4, cidr)
+			} else {
+				ipv6 = append(ipv6, cidr)
+			}
+		}
+	}
+
+	return ipv4, ipv6, nil
+}
+
 func entrypoint(ctx context.Context) {
 	dockerGatewayIP, err := lookupDockerIPv4(ctx)
 	if err != nil {
@@ -346,6 +376,11 @@ func entrypoint(ctx context.Context) {
 
 	cleanupIptables(ctx)
 
+	deviceCIDRsV4, deviceCIDRsV6, err := networkDeviceCIDRs()
+	if err != nil {
+		fatal(err)
+	}
+
 	type ipTablesSetup struct {
 		ipTablesCmd     string
 		ipVersion       string
@@ -353,11 +388,17 @@ func entrypoint(ctx context.Context) {
 		proxy           *proxy
 	}
 
+	ipv4Ignored := []string{"127.0.0.1/8", dockerNetwork.String(), egressIP.String() + "/24"}
+	ipv4Ignored = append(ipv4Ignored, deviceCIDRsV4...)
+
+	ipv6Ignored := []string{"::1/128"}
+	ipv6Ignored = append(ipv6Ignored, deviceCIDRsV6...)
+
 	ipTablesSetupList := []ipTablesSetup{
 		{
 			ipTablesCmd:     "iptables",
 			ipVersion:       "-4",
-			ignoreAddresses: []string{"127.0.0.1/8", dockerNetwork.String(), egressIP.String() + "/24"},
+			ignoreAddresses: ipv4Ignored,
 			proxy:           proxies[0],
 		},
 	}
@@ -366,7 +407,7 @@ func entrypoint(ctx context.Context) {
 		ipTablesSetupList = append(ipTablesSetupList, ipTablesSetup{
 			ipTablesCmd:     "ip6tables",
 			ipVersion:       "-6",
-			ignoreAddresses: []string{"::1/128"},
+			ignoreAddresses: ipv6Ignored,
 			proxy:           proxies[1],
 		})
 	}
