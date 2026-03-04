@@ -116,6 +116,34 @@ $ docker network inspect bridge
 By the default by this example,
 the TCP address you should be listening in to receive proxy-everything traffic is `172.17.0.1:49121`.
 
+# TLS interception
+
+Pass `-tls-intercept` to terminate TLS inside the proxy so the gateway sees plaintext.
+
+```bash
+docker run \
+    -it --rm --cap-add=NET_ADMIN \
+    --network container:$(CONTAINER) \
+    proxy-everything:dev -tls-intercept
+```
+
+At startup an ephemeral CA is written to `/ca/ca.crt` and `/ca/ca.key`.
+For outbound TLS connections the proxy peeks the SNI from the ClientHello and
+adds an `X-Tls-Sni` header to the CONNECT request. The gateway then decides:
+
+- **200** -- terminate TLS. The proxy presents a leaf cert (signed by the ephemeral CA) to the container and forwards plaintext to the gateway.
+- **202** -- pass-through. Raw TLS bytes are forwarded as-is; the session stays end-to-end between the container and the origin.
+
+To make the container trust the CA:
+
+```bash
+docker cp $(CONTAINER)-proxy:/ca/ca.crt /tmp/ca.crt
+docker cp /tmp/ca.crt $(CONTAINER):/usr/local/share/ca-certificates/proxy-everything.crt
+docker exec $(CONTAINER) update-ca-certificates
+```
+
+Without `-tls-intercept` all traffic is forwarded as raw bytes and no CA is generated.
+
 # Philosophy
 1. Make it work with docker defaults.
 2. Multiplatform.

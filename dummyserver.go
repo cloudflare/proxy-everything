@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -75,6 +76,13 @@ func startDummyServer(addr net.Addr) {
 
 			destinationAddr := req.Host
 			dialer := net.Dialer{}
+			if req.Header.Get("X-Tls-Sni") != "" {
+				// Just a hack to test that it works...
+				if addr, found := strings.CutSuffix(destinationAddr, ":443"); found {
+					destinationAddr = addr + ":80"
+				}
+			}
+
 			originConn, err := dialer.Dial("tcp", destinationAddr)
 			response := http.Response{
 				ProtoMajor: 1,

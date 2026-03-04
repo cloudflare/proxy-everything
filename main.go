@@ -154,19 +154,24 @@ func (c *bufioNetConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress string, gateway net.Addr) (closeReadWriter, error) {
+// dialHTTPConnect sends an HTTP CONNECT request to the gateway.
+// When sni is non-empty, it includes an X-Tls-Sni header. The gateway
+// responds 200 when it wants to receive decrypted plaintext (the caller
+// should terminate TLS) or 202 when the caller should pass bytes through
+// unmodified. shouldDecryptTLS reflects this decision.
+func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress string, gateway net.Addr, sni string) (closeReadWriter, bool, error) {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, gateway.Network(), gateway.String())
 	if err != nil {
-		return nil, fmt.Errorf("dialing gateway: %w", err)
+		return nil, false, fmt.Errorf("dialing gateway: %w", err)
 	}
 
 	switch conn.(type) {
 	case *net.UDPConn:
-		return nil, errors.New("udp connections are not accepted")
+		return nil, false, errors.New("udp connections are not accepted")
 	case *net.UnixConn, *net.TCPConn:
 	default:
-		return nil, fmt.Errorf("unknown connection type: %T", conn)
+		return nil, false, fmt.Errorf("unknown connection type: %T", conn)
 	}
 
 	ur := url.URL{
@@ -180,6 +185,10 @@ func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress
 	headers.Add("X-Forwarded-For", sourceAddress)
 	headers.Add("X-Proto", network)
 
+	if sni != "" {
+		headers.Add("X-Tls-Sni", sni)
+	}
+
 	proxyHTTPRequest := &http.Request{
 		Method:     http.MethodConnect,
 		URL:        &ur,
@@ -190,20 +199,26 @@ func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress
 	}
 
 	if err := proxyHTTPRequest.Write(conn); err != nil {
-		return nil, fmt.Errorf("http write: %w", err)
+		return nil, false, fmt.Errorf("http write: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
 	res, err := http.ReadResponse(reader, proxyHTTPRequest)
 	if err != nil {
-		return nil, fmt.Errorf("reading proxy http request: %w", err)
+		return nil, false, fmt.Errorf("reading proxy http request: %w", err)
 	}
 
 	if res.StatusCode == http.StatusBadRequest {
-		return nil, fmt.Errorf("%v: %w", res.StatusCode, ErrConnRefused)
+		return nil, false, fmt.Errorf("%v: %w", res.StatusCode, ErrConnRefused)
 	}
 
-	return &bufioNetConn{conn.(closeReadWriter), reader}, nil
+	if res.StatusCode >= 300 {
+		return nil, false, fmt.Errorf("%v: %w", res.StatusCode, ErrNon2xx)
+	}
+
+	// 200 means the gateway wants decrypted plaintext; 202 means pass through.
+	shouldDecryptTLS := sni != "" && res.StatusCode == http.StatusOK
+	return &bufioNetConn{conn.(closeReadWriter), reader}, shouldDecryptTLS, nil
 }
 
 var egressPort *int = flag.Int("http-egress-port", 49121, "the port where the gateway is going to be reaching to in order to receive connections")
@@ -212,14 +227,16 @@ var proxyAnythingV6Address *string = flag.String("address-v6", "[::1]:41209", "d
 var dockerGatewayCidr *string = flag.String("docker-gateway-cidr", "172.17.0.0/16", "the docker gateway to be used")
 var disableIPv6 *bool = flag.Bool("disable-ipv6", false, "disable ipv6 if not necessary")
 var gatewayIP *string = flag.String("gateway-ip", "", "set to override looking up the host-gateway")
+var tlsIntercept *bool = flag.Bool("tls-intercept", false, "enable TLS interception for outbound HTTPS")
 
 type proxy struct {
 	addr       *net.TCPAddr
 	listener   net.Listener
 	egressAddr net.Addr
+	tlsFactory TLSServerFactory // nil when TLS interception is disabled
 }
 
-func newProxy(ctx context.Context, addr *net.TCPAddr, egressAddr net.Addr) *proxy {
+func newProxy(ctx context.Context, addr *net.TCPAddr, egressAddr net.Addr, tlsFactory TLSServerFactory) *proxy {
 	config := net.ListenConfig{
 		Control: func(network string, addr string, conn syscall.RawConn) error {
 			return conn.Control(func(fd uintptr) {
@@ -235,11 +252,54 @@ func newProxy(ctx context.Context, addr *net.TCPAddr, egressAddr net.Addr) *prox
 		fatal(fmt.Errorf("couldn't listen on port, is another proxy-everything running?: %w", err))
 	}
 
-	return &proxy{addr: addr, listener: listener, egressAddr: egressAddr}
+	return &proxy{addr: addr, listener: listener, egressAddr: egressAddr, tlsFactory: tlsFactory}
 }
 
 func (p *proxy) Close() error {
 	return p.listener.Close()
+}
+
+// peekSNI peeks at the first bytes of a buffered connection. If they look
+// like a TLS ClientHello, it parses and returns the SNI hostname. Returns
+// empty string if the traffic is not TLS or SNI cannot be determined.
+// Does not consume the bufio.Reader as it peeks.
+func peekSNI(r *bufio.Reader) string {
+	// Peek a single byte first so non-TLS connections aren't blocked
+	// waiting for more bytes that may never arrive.
+	first, err := r.Peek(1)
+	if err != nil {
+		log.Println("debug: peek for TLS detection failed:", err)
+		return ""
+	}
+
+	if first[0] != 0x16 { // not a TLS handshake record
+		return ""
+	}
+
+	// Now we know it looks like TLS. Read the rest of the record header.
+	// TLS record header: content_type(1) + legacy_version(2) + length(2)
+	const tlsRecordHeaderLen = 5
+
+	header, err := r.Peek(tlsRecordHeaderLen)
+	if err != nil {
+		log.Println("debug: peek for TLS record header failed:", err)
+		return ""
+	}
+
+	recordLen := int(header[3])<<8 | int(header[4])
+	peekLen := min(r.Size(), tlsRecordHeaderLen+recordLen)
+	record, err := r.Peek(peekLen)
+	if err != nil {
+		log.Println("debug: peek for TLS ClientHello failed:", err)
+		return ""
+	}
+
+	sni, err := extractSNI(record)
+	if err != nil {
+		log.Println("debug: SNI extraction failed:", err)
+	}
+
+	return sni
 }
 
 func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
@@ -261,9 +321,21 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 				wg := &sync.WaitGroup{}
 				defer wg.Wait()
 
-				log.Println("debug: received connection", sourceAddr, "to", dstAddr)
+				var sni string
+				var containerBuf *bufio.Reader
+				if p.tlsFactory != nil {
+					containerBuf = bufio.NewReaderSize(containerConnection, 4096)
+					sni = peekSNI(containerBuf)
+				}
 
-				originConnection, err := dialHTTPConnect(ctx, dstAddr.Network(), dstAddr.String(), sourceAddr.String(), p.egressAddr)
+				originConnection, shouldDecryptTLS, err := dialHTTPConnect(
+					ctx,
+					dstAddr.Network(),
+					dstAddr.String(),
+					sourceAddr.String(),
+					p.egressAddr,
+					sni,
+				)
 				if err != nil {
 					if err := rstTCPConnection(containerConnection); err != nil {
 						log.Println("error sending rst to connection:", err)
@@ -273,18 +345,45 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 					return
 				}
 
+				// Build the container-side connection used for the pump.
+				// Three cases: raw TCP, buffered TCP (peeked but passthrough),
+				// or TLS-terminated (plaintext <> gateway).
+				var containerRW closeReadWriter = containerConnection
+				if shouldDecryptTLS && p.tlsFactory != nil {
+					bc := &bufioNetConn{reader: containerBuf, closeReadWriter: containerConnection}
+					tlsConn, err := p.tlsFactory.NewServer(bc)
+
+					if err != nil {
+						log.Println("error: TLS handshake with container:", err)
+						if err := rstTCPConnection(containerConnection); err != nil {
+							log.Println("error sending rst to connection:", err)
+						}
+
+						originConnection.Close()
+						return
+					}
+
+					// it's a buffered tlsConn
+					containerRW = &tlsCloseConn{Conn: tlsConn, onCloseRead: containerConnection.CloseRead}
+				} else if containerBuf != nil {
+					containerRW = &bufioNetConn{
+						closeReadWriter: containerConnection,
+						reader:          containerBuf,
+					}
+				}
+
 				// container -> gateway
 				wg.Go(func() {
-					defer containerConnection.CloseRead()
+					defer containerRW.CloseRead()
 					defer originConnection.CloseWrite()
-					io.Copy(originConnection, containerConnection)
+					io.Copy(originConnection, containerRW)
 				})
 
 				// gateway -> container
 				wg.Go(func() {
 					defer originConnection.CloseRead()
-					defer containerConnection.CloseWrite()
-					io.Copy(containerConnection, originConnection)
+					defer containerRW.CloseWrite()
+					io.Copy(containerRW, originConnection)
 				})
 			})
 		}
@@ -343,6 +442,31 @@ func entrypoint(ctx context.Context) {
 
 	flag.Parse()
 
+	var tlsFactory TLSServerFactory
+	if *tlsIntercept {
+		if err := createCA("/ca/ca.crt", "/ca/ca.key"); err != nil {
+			fatal(fmt.Errorf("creating TLS intercept CA: %w", err))
+		}
+
+		certPEM, err := os.ReadFile("/ca/ca.crt")
+		if err != nil {
+			fatal(fmt.Errorf("reading CA cert: %w", err))
+		}
+
+		keyPEM, err := os.ReadFile("/ca/ca.key")
+		if err != nil {
+			fatal(fmt.Errorf("reading CA key: %w", err))
+		}
+
+		factory, err := NewTLSInterceptor(certPEM, keyPEM)
+		if err != nil {
+			fatal(fmt.Errorf("creating TLS interceptor: %w", err))
+		}
+
+		tlsFactory = factory
+		log.Println("TLS interception enabled, CA written to /ca/ca.crt")
+	}
+
 	egressAddress, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(egressIP.String(), strconv.Itoa(*egressPort)))
 	if err != nil {
 		fatal(err)
@@ -364,12 +488,12 @@ func entrypoint(ctx context.Context) {
 	}
 
 	proxies := []*proxy{
-		newProxy(ctx, proxyAnythingAddressTCP, egressAddress),
+		newProxy(ctx, proxyAnythingAddressTCP, egressAddress, tlsFactory),
 	}
 
 	if !*disableIPv6 {
 		proxies = append(proxies,
-			newProxy(ctx, proxyAnythingAddressV6TCP, egressAddress))
+			newProxy(ctx, proxyAnythingAddressV6TCP, egressAddress, tlsFactory))
 	}
 
 	fmt.Printf("Proxy address: %s, Port: %d\n", proxyAnythingAddressTCP.IP.String(), proxyAnythingAddressTCP.Port)
