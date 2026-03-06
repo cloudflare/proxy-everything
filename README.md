@@ -184,6 +184,7 @@ iptables -t mangle -A PREROUTING -p tcp -j PROXY
 
 # Only for local mode
 iptables -t mangle -N PROXY_LOCAL
+iptables -t mangle -A PROXY_LOCAL -p tcp -m conntrack --ctdir REPLY -j RETURN
 iptables -t mangle -A PROXY_LOCAL -p tcp -d 127.0.0.0/8 -j RETURN
 iptables -t mangle -A PROXY_LOCAL -p tcp -d 255.255.255.255/32 -j RETURN
 iptables -t mangle -A PROXY_LOCAL -p tcp -d 192.168.0.0/16 -j RETURN

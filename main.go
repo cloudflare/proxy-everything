@@ -581,6 +581,9 @@ func entrypoint(ctx context.Context) {
 		// ensure the chain starts empty before adding rules
 		mustRunCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespace)
 
+		// Do not re-mark reply traffic for inbound connections accepted by a local socket.
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespace, "-p", "tcp", "-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN")
+
 		for _, cidrToIgnore := range iptablesSetup.ignoreAddresses {
 			mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespace, "-d", cidrToIgnore, "-j", "RETURN")
 		}
