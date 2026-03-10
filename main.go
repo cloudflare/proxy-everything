@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -222,6 +224,7 @@ func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress
 }
 
 var egressPort *int = flag.Int("http-egress-port", 49121, "the port where the gateway is going to be reaching to in order to receive connections")
+var ingressAddress *string = flag.String("http-ingress-address", "", "the address where the ingress HTTP CONNECT listener will accept connections; empty disables it")
 var proxyAnythingAddress *string = flag.String("address", "127.0.0.3:41209", "default address that proxy-everything will intercept traffic in")
 var proxyAnythingV6Address *string = flag.String("address-v6", "[::1]:41209", "default address that proxy-everything will intercept traffic in ipv6")
 var dockerGatewayCidr *string = flag.String("docker-gateway-cidr", "172.17.0.0/16", "the docker gateway to be used")
@@ -229,14 +232,228 @@ var disableIPv6 *bool = flag.Bool("disable-ipv6", false, "disable ipv6 if not ne
 var gatewayIP *string = flag.String("gateway-ip", "", "set to override looking up the host-gateway")
 var tlsIntercept *bool = flag.Bool("tls-intercept", false, "enable TLS interception for outbound HTTPS")
 
+type egressConfiguration struct {
+	port atomic.Int64
+}
+
+func newEgressConfiguration(port int) (*egressConfiguration, error) {
+	if err := validatePort(port); err != nil {
+		return nil, err
+	}
+
+	config := &egressConfiguration{}
+	config.port.Store(int64(port))
+	return config, nil
+}
+
+func (t *egressConfiguration) Port() int {
+	return int(t.port.Load())
+}
+
+func (t *egressConfiguration) SetPort(port int) error {
+	if err := validatePort(port); err != nil {
+		return err
+	}
+
+	t.port.Store(int64(port))
+
+	return nil
+}
+
+func validatePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %d", port)
+	}
+
+	return nil
+}
+
+type ingressServer struct {
+	addr     *net.TCPAddr
+	listener net.Listener
+	egress   *egressConfiguration
+}
+
+func newIngressServer(addr *net.TCPAddr, egress *egressConfiguration) *ingressServer {
+	listener, err := net.Listen(addr.Network(), addr.String())
+	if err != nil {
+		fatal(fmt.Errorf("couldn't listen on ingress address %s: %w", addr.String(), err))
+	}
+
+	return &ingressServer{addr: addr, listener: listener, egress: egress}
+}
+
+func (s *ingressServer) Close() error {
+	return s.listener.Close()
+}
+
+func (s *ingressServer) run(ctx context.Context, wg *sync.WaitGroup) {
+	wg.Go(func() {
+		for {
+			conn, err := s.listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+
+				log.Println("error accepting ingress connection:", err)
+				return
+			}
+
+			wg.Go(func() {
+				s.handleConn(ctx, conn)
+			})
+		}
+	})
+}
+
+func (s *ingressServer) handleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+
+	// Wrap in a buffered reader so ReadRequest can peek on the connection and
+	// we can read the buffered bytes that were stored through the peek.
+	reader := bufio.NewReader(conn)
+
+	// We have to do the ReadRequest because this can be a HTTP CONNECT!
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		log.Println("error reading ingress request:", err)
+		return
+	}
+
+	defer req.Body.Close()
+	switch req.Method {
+	case http.MethodConnect:
+		// proxy to the target destination
+		s.handleConnect(ctx, conn, reader, req)
+	case http.MethodPut:
+		// handlePut can update configuration
+		s.handlePut(conn, req)
+	default:
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusMethodNotAllowed}).Write(conn); err != nil {
+			log.Println("error writing method not allowed response:", err)
+		}
+	}
+}
+
+func (s *ingressServer) handleConnect(ctx context.Context, clientConn net.Conn, reader *bufio.Reader, req *http.Request) {
+	targetAddr, err := ingressTargetAddrFromHeader(req)
+	if err != nil {
+		if writeErr := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(clientConn); writeErr != nil {
+			log.Println("error writing missing target response:", writeErr)
+		}
+
+		log.Println("error resolving ingress target address:", err)
+		return
+	}
+
+	originConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
+	response := http.Response{ProtoMajor: 1, ProtoMinor: 1}
+	if err != nil {
+		response.StatusCode = http.StatusBadRequest
+		if writeErr := response.Write(clientConn); writeErr != nil {
+			log.Println("error writing ingress dial failure response:", writeErr)
+		}
+
+		log.Println("error dialing ingress target", targetAddr, err)
+		return
+	}
+	defer originConn.Close()
+
+	response.StatusCode = http.StatusOK
+	if err := response.Write(clientConn); err != nil {
+		log.Println("error writing ingress connect response:", err)
+		return
+	}
+
+	var tunnelWG sync.WaitGroup
+	tunnelWG.Go(func() {
+		defer tryClosingWriteSide(originConn)
+		defer tryClosingReadSide(clientConn)
+		io.Copy(originConn, reader)
+	})
+
+	tunnelWG.Go(func() {
+		defer tryClosingWriteSide(clientConn)
+		defer tryClosingReadSide(originConn)
+		io.Copy(clientConn, originConn)
+	})
+
+	tunnelWG.Wait()
+}
+
+func ingressTargetAddrFromHeader(req *http.Request) (string, error) {
+	targetAddr := req.Header.Get("X-Dst-Addr")
+	if targetAddr == "" {
+		return "", errors.New("missing X-Dst-Addr header")
+	}
+
+	host, port, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		return "", errors.New("X-Dst-Addr must be IP:port")
+	}
+
+	if host == "" {
+		return "", errors.New("empty host in X-Dst-Addr header")
+	}
+
+	if port == "" {
+		return "", errors.New("empty port in X-Dst-Addr header")
+	}
+
+	if net.ParseIP(host) == nil {
+		return "", errors.New("X-Dst-Addr host must be an IP address")
+	}
+
+	return net.JoinHostPort(host, port), nil
+}
+
+func (s *ingressServer) handlePut(conn net.Conn, req *http.Request) {
+	if req.URL.Path != "/egress" {
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusNotFound}).Write(conn); err != nil {
+			log.Println("error writing not found response:", err)
+		}
+
+		return
+	}
+
+	var payload struct {
+		Port int `json:"port"`
+	}
+
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(conn); err != nil {
+			log.Println("error writing bad put response:", err)
+		}
+
+		log.Println("error decoding egress configuration update:", err)
+		return
+	}
+
+	if err := s.egress.SetPort(payload.Port); err != nil {
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(conn); err != nil {
+			log.Println("error writing invalid port response:", err)
+		}
+
+		log.Println("error updating egress configuration:", err)
+		return
+	}
+
+	log.Println("updated shared egress port to", payload.Port)
+	if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusNoContent}).Write(conn); err != nil {
+		log.Println("error writing put success response:", err)
+	}
+}
+
 type proxy struct {
 	addr       *net.TCPAddr
 	listener   net.Listener
-	egressAddr net.Addr
+	egressIP   net.IP
+	egress     *egressConfiguration
 	tlsFactory TLSServerFactory // nil when TLS interception is disabled
 }
 
-func newProxy(ctx context.Context, addr *net.TCPAddr, egressAddr net.Addr, tlsFactory TLSServerFactory) *proxy {
+func newProxy(ctx context.Context, addr *net.TCPAddr, egressIP net.IP, egress *egressConfiguration, tlsFactory TLSServerFactory) *proxy {
 	config := net.ListenConfig{
 		Control: func(network string, addr string, conn syscall.RawConn) error {
 			return conn.Control(func(fd uintptr) {
@@ -252,7 +469,11 @@ func newProxy(ctx context.Context, addr *net.TCPAddr, egressAddr net.Addr, tlsFa
 		fatal(fmt.Errorf("couldn't listen on port, is another proxy-everything running?: %w", err))
 	}
 
-	return &proxy{addr: addr, listener: listener, egressAddr: egressAddr, tlsFactory: tlsFactory}
+	return &proxy{addr: addr, listener: listener, egressIP: egressIP, egress: egress, tlsFactory: tlsFactory}
+}
+
+func (p *proxy) gatewayAddr() net.Addr {
+	return &net.TCPAddr{IP: append(net.IP(nil), p.egressIP...), Port: p.egress.Port()}
 }
 
 func (p *proxy) Close() error {
@@ -333,7 +554,7 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 					dstAddr.Network(),
 					dstAddr.String(),
 					sourceAddr.String(),
-					p.egressAddr,
+					p.gatewayAddr(),
 					sni,
 				)
 				if err != nil {
@@ -422,6 +643,8 @@ func networkDeviceCIDRs() (ipv4 []string, ipv6 []string, err error) {
 }
 
 func entrypoint(ctx context.Context) {
+	flag.Parse()
+
 	dockerGatewayIP, err := lookupDockerIPv4(ctx)
 	if err != nil {
 		fatal(err)
@@ -436,11 +659,6 @@ func entrypoint(ctx context.Context) {
 	if gatewayIPResolved != nil {
 		egressIP = gatewayIPResolved
 	}
-
-	// unused for now but indicates future feature work
-	flag.Int("http-ingress-port", 49122, "the port where the gateway is going to be listening in to receive connections")
-
-	flag.Parse()
 
 	var tlsFactory TLSServerFactory
 	if *tlsIntercept {
@@ -467,9 +685,20 @@ func entrypoint(ctx context.Context) {
 		log.Println("TLS interception enabled, CA written to /ca/ca.crt")
 	}
 
-	egressAddress, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(egressIP.String(), strconv.Itoa(*egressPort)))
+	egressConfig, err := newEgressConfiguration(*egressPort)
 	if err != nil {
 		fatal(err)
+	}
+
+	var ingressServer *ingressServer
+	var ingressAddressTCP *net.TCPAddr
+	if *ingressAddress != "" {
+		ingressAddressTCP, err = net.ResolveTCPAddr("tcp", *ingressAddress)
+		if err != nil {
+			fatal(fmt.Errorf("resolving ingress tcp addr: %w", err))
+		}
+
+		ingressServer = newIngressServer(ingressAddressTCP, egressConfig)
 	}
 
 	_, dockerNetwork, err := net.ParseCIDR(*dockerGatewayCidr)
@@ -488,12 +717,12 @@ func entrypoint(ctx context.Context) {
 	}
 
 	proxies := []*proxy{
-		newProxy(ctx, proxyAnythingAddressTCP, egressAddress, tlsFactory),
+		newProxy(ctx, proxyAnythingAddressTCP, egressIP, egressConfig, tlsFactory),
 	}
 
 	if !*disableIPv6 {
 		proxies = append(proxies,
-			newProxy(ctx, proxyAnythingAddressV6TCP, egressAddress, tlsFactory))
+			newProxy(ctx, proxyAnythingAddressV6TCP, egressIP, egressConfig, tlsFactory))
 	}
 
 	fmt.Printf("Proxy address: %s, Port: %d\n", proxyAnythingAddressTCP.IP.String(), proxyAnythingAddressTCP.Port)
@@ -604,10 +833,17 @@ func entrypoint(ctx context.Context) {
 	for _, proxy := range proxies {
 		defer proxy.Close()
 	}
+	if ingressServer != nil {
+		defer ingressServer.Close()
+	}
 
 	defer wg.Wait()
 	for _, proxy := range proxies {
 		proxy.run(ctx, wg)
+	}
+	if ingressServer != nil {
+		ingressServer.run(ctx, wg)
+		log.Printf("Ingress listener accepting CONNECT on %s using shared egress configuration", ingressAddressTCP.String())
 	}
 }
 

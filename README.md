@@ -144,6 +144,27 @@ docker exec $(CONTAINER) update-ca-certificates
 
 Without `-tls-intercept` all traffic is forwarded as raw bytes and no CA is generated.
 
+# Ingress CONNECT listener
+
+Pass `-http-ingress-address=<ip:port>` to enable an always-on ingress listener inside `proxy-everything`.
+If the flag is empty, no ingress listener is started.
+
+- `CONNECT` requests are accepted on that listener.
+- `X-Dst-Addr` must contain the full destination as `IP:port`.
+- If the destination port is closed, the listener returns `400`.
+- `PUT /egress` updates `http-egress-port`, which is the TPROXY egress gateway port, with a JSON body like `{"port": 8080}`.
+
+Example:
+
+```bash
+curl -X PUT http://127.0.0.1:49122/egress \
+  -H 'Content-Type: application/json' \
+  -d '{"port":8080}'
+
+curl -v -x http://127.0.0.1:49122 https://ignored.example \
+  -H 'X-Dst-Addr: 172.17.0.1:8443'
+```
+
 # Philosophy
 1. Make it work with docker defaults.
 2. Multiplatform.
