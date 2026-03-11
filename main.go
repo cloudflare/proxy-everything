@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -326,6 +327,9 @@ func (s *ingressServer) handleConn(ctx context.Context, conn net.Conn) {
 	case http.MethodConnect:
 		// proxy to the target destination
 		s.handleConnect(ctx, conn, reader, req)
+	case http.MethodGet:
+		// handleGet can read resources
+		s.handleGet(conn, req)
 	case http.MethodPut:
 		// handlePut can update configuration
 		s.handlePut(conn, req)
@@ -406,6 +410,39 @@ func ingressTargetAddrFromHeader(req *http.Request) (string, error) {
 	}
 
 	return net.JoinHostPort(host, port), nil
+}
+
+func (s *ingressServer) handleGet(conn net.Conn, req *http.Request) {
+	if req.URL.Path != "/ca" {
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusNotFound}).Write(conn); err != nil {
+			log.Println("error writing not found response:", err)
+		}
+
+		return
+	}
+
+	certPEM, err := os.ReadFile("/ca/ca.crt")
+	if err != nil {
+		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusNotFound}).Write(conn); err != nil {
+			log.Println("error writing cert not found response:", err)
+		}
+
+		log.Println("error reading CA certificate:", err)
+		return
+	}
+
+	resp := &http.Response{
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": {"application/x-pem-file"}},
+		Body:          io.NopCloser(bytes.NewReader(certPEM)),
+		ContentLength: int64(len(certPEM)),
+	}
+
+	if err := resp.Write(conn); err != nil {
+		log.Println("error writing CA certificate response:", err)
+	}
 }
 
 func (s *ingressServer) handlePut(conn net.Conn, req *http.Request) {
@@ -841,6 +878,7 @@ func entrypoint(ctx context.Context) {
 	for _, proxy := range proxies {
 		proxy.run(ctx, wg)
 	}
+
 	if ingressServer != nil {
 		ingressServer.run(ctx, wg)
 		log.Printf("Ingress listener accepting CONNECT on %s using shared egress configuration", ingressAddressTCP.String())

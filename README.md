@@ -152,11 +152,15 @@ If the flag is empty, no ingress listener is started.
 - `CONNECT` requests are accepted on that listener.
 - `X-Dst-Addr` must contain the full destination as `IP:port`.
 - If the destination port is closed, the listener returns `400`.
+- `GET /ca` returns the PEM-encoded CA certificate (`/ca/ca.crt`). Only useful when `-tls-intercept` is enabled. Returns `404` if the certificate doesn't exist.
 - `PUT /egress` updates `http-egress-port`, which is the TPROXY egress gateway port, with a JSON body like `{"port": 8080}`.
 
 Example:
 
 ```bash
+# Fetch the CA certificate (requires -tls-intercept)
+curl http://127.0.0.1:49122/ca -o ca.crt
+
 curl -X PUT http://127.0.0.1:49122/egress \
   -H 'Content-Type: application/json' \
   -d '{"port":8080}'
