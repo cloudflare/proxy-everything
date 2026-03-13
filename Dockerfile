@@ -1,7 +1,7 @@
 FROM golang:1.25-bookworm AS builder
 
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY *.go ./
 RUN CGO_ENABLED=0 go build -ldflags="-s -w -buildid=" -tags=nethttpomithttp2 -trimpath -o proxy-everything .
 

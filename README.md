@@ -41,6 +41,10 @@ A gateway server should:
    X-Proto: tcp
    ```
 
+   Optional headers may also be present:
+   - `X-Tls-Sni: <hostname>` when outbound TLS traffic exposes SNI.
+   - `X-Hostname: <hostname>` when outbound HTTP traffic exposes a `Host` header and no SNI was available.
+
 3. **Parse the destination** from the `Host` header (or request URI) to know where to dial.
 
 4. **Establish a connection to the destination** (the original target the container wanted to reach).
@@ -129,7 +133,9 @@ docker run \
 
 At startup an ephemeral CA is written to `/ca/ca.crt` and `/ca/ca.key`.
 For outbound TLS connections the proxy peeks the SNI from the ClientHello and
-adds an `X-Tls-Sni` header to the CONNECT request. The gateway then decides:
+adds an `X-Tls-Sni` header to the CONNECT request. If no SNI is present and the
+payload looks like HTTP, it also peeks the HTTP request headers and adds
+`X-Hostname`. The gateway then decides:
 
 - **200** -- terminate TLS. The proxy presents a leaf cert (signed by the ephemeral CA) to the container and forwards plaintext to the gateway.
 - **202** -- pass-through. Raw TLS bytes are forwarded as-is; the session stays end-to-end between the container and the origin.
@@ -153,7 +159,10 @@ If the flag is empty, no ingress listener is started.
 - `X-Dst-Addr` must contain the full destination as `IP:port`.
 - If the destination port is closed, the listener returns `400`.
 - `GET /ca` returns the PEM-encoded CA certificate (`/ca/ca.crt`). Only useful when `-tls-intercept` is enabled. Returns `404` if the certificate doesn't exist.
-- `PUT /egress` updates `http-egress-port`, which is the TPROXY egress gateway port, with a JSON body like `{"port": 8080}`.
+- `PUT /egress` updates shared runtime configuration. Supported fields are:
+  - `port` -- updates `http-egress-port`
+  - `internet.enabled` -- enables or disables internet forwarding for DNS interception
+  - `dns.allowHostnames` -- array of hostname globs such as `*.google.com`, `google.com`, or `*`
 
 Example:
 
@@ -163,11 +172,26 @@ curl http://127.0.0.1:49122/ca -o ca.crt
 
 curl -X PUT http://127.0.0.1:49122/egress \
   -H 'Content-Type: application/json' \
-  -d '{"port":8080}'
+  -d '{"port":8080,"internet":{"enabled":true},"dns":{"allowHostnames":["*.google.com","google.com"]}}'
 
 curl -v -x http://127.0.0.1:49122 https://ignored.example \
   -H 'X-Dst-Addr: 172.17.0.1:8443'
 ```
+
+# DNS interception
+
+UDP interception is currently limited to DNS on port `53` and is optional.
+
+- Pass `-dns-enabled` to enable DNS interception.
+- `-dns-address` controls the IPv4 transparent DNS listener address. Default: `127.0.0.9:5000`.
+- `-dns-address-v6` controls the IPv6 transparent DNS listener address. Default: `[::1]:50009`.
+
+Behavior:
+
+- If `internet.enabled=true`, intercepted DNS queries are forwarded to the original resolver and the upstream response is normally relayed unchanged.
+- If the upstream response is `NXDOMAIN` and the queried hostname matches `dns.allowHostnames`, the proxy synthesizes a fallback answer instead of returning `NXDOMAIN`.
+- If `internet.enabled=false`, the query is handled locally: matching hostnames get a fallback answer and non-matching hostnames get `NXDOMAIN`.
+- Fallback answers are currently `11.0.0.1` for `A` queries and `fd00::1` for `AAAA` queries.
 
 # Philosophy
 1. Make it work with docker defaults.
@@ -175,7 +199,7 @@ curl -v -x http://127.0.0.1:49122 https://ignored.example \
 3. HTTP CONNECT everything.
 
 # Current limitations
-1. UDP is out-of-scope currently.
+1. UDP support is currently limited to DNS on port `53`.
 2. Proxying to unix sockets is not implemented yet due to lack of support on MacOS.
 
 # TLDR: How?

@@ -73,19 +73,29 @@ const iptablesNamespace = "DOCKER_PROXY_ANYTHING"
 
 const iptablesNamespaceTproxy = iptablesNamespace + "_TPROXY"
 
+const iptablesNamespaceDNS = "DOCKER_PROXY_DNS"
+
+const iptablesNamespaceDNSTproxy = iptablesNamespaceDNS + "_TPROXY"
+
 func cleanupIptables(ctx context.Context) {
 	// Ignore errors during cleanup
 	for _, iptables := range []string{"iptables", "ip6tables"} {
 		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesNamespace)
 		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesNamespaceTproxy)
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesNamespaceDNSTproxy)
 		runCommand(ctx, iptables, "-t", "mangle", "-D", "PREROUTING", "-p", "tcp", "-m", "socket", "-j", "DIVERT")
 		runCommand(ctx, iptables, "-t", "mangle", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesNamespace)
+		runCommand(ctx, iptables, "-t", "mangle", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesNamespaceDNS)
 		runCommand(ctx, iptables, "-t", "mangle", "-F", "DIVERT")
 		runCommand(ctx, iptables, "-t", "mangle", "-X", "DIVERT")
 		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespace)
 		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespace)
 		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceTproxy)
 		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespaceTproxy)
+		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceDNS)
+		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespaceDNS)
+		runCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceDNSTproxy)
+		runCommand(ctx, iptables, "-t", "mangle", "-X", iptablesNamespaceDNSTproxy)
 	}
 
 	for _, version := range []string{"-4", "-6"} {
@@ -150,7 +160,7 @@ type closeReadWriter interface {
 
 type bufioNetConn struct {
 	closeReadWriter
-	reader *bufio.Reader
+	reader io.Reader
 }
 
 func (c *bufioNetConn) Read(b []byte) (int, error) {
@@ -158,11 +168,12 @@ func (c *bufioNetConn) Read(b []byte) (int, error) {
 }
 
 // dialHTTPConnect sends an HTTP CONNECT request to the gateway.
-// When sni is non-empty, it includes an X-Tls-Sni header. The gateway
-// responds 200 when it wants to receive decrypted plaintext (the caller
-// should terminate TLS) or 202 when the caller should pass bytes through
-// unmodified. shouldDecryptTLS reflects this decision.
-func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress string, gateway net.Addr, sni string) (closeReadWriter, bool, error) {
+// When sni is non-empty, it includes an X-Tls-Sni header. When hostname is
+// non-empty, it includes an X-Hostname header. The gateway responds 200 when
+// it wants to receive decrypted plaintext (the caller should terminate TLS)
+// or 202 when the caller should pass bytes through unmodified.
+// shouldDecryptTLS reflects this decision.
+func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress string, gateway net.Addr, sni string, hostname string) (closeReadWriter, bool, error) {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, gateway.Network(), gateway.String())
 	if err != nil {
@@ -190,6 +201,10 @@ func dialHTTPConnect(ctx context.Context, network string, address, sourceAddress
 
 	if sni != "" {
 		headers.Add("X-Tls-Sni", sni)
+	}
+
+	if hostname != "" {
+		headers.Add("X-Hostname", hostname)
 	}
 
 	proxyHTTPRequest := &http.Request{
@@ -234,7 +249,13 @@ var gatewayIP *string = flag.String("gateway-ip", "", "set to override looking u
 var tlsIntercept *bool = flag.Bool("tls-intercept", false, "enable TLS interception for outbound HTTPS")
 
 type egressConfiguration struct {
-	port atomic.Int64
+	port            atomic.Int64
+	internetEnabled atomic.Bool
+	dns             atomic.Pointer[dnsRuntimeConfiguration]
+}
+
+type dnsRuntimeConfiguration struct {
+	AllowPatterns []string
 }
 
 func newEgressConfiguration(port int) (*egressConfiguration, error) {
@@ -244,6 +265,10 @@ func newEgressConfiguration(port int) (*egressConfiguration, error) {
 
 	config := &egressConfiguration{}
 	config.port.Store(int64(port))
+	config.internetEnabled.Store(true)
+	config.dns.Store(&dnsRuntimeConfiguration{
+		AllowPatterns: []string{"*"},
+	})
 	return config, nil
 }
 
@@ -258,6 +283,43 @@ func (t *egressConfiguration) SetPort(port int) error {
 
 	t.port.Store(int64(port))
 
+	return nil
+}
+
+func (t *egressConfiguration) dnsConfig() dnsRuntimeConfiguration {
+	config := t.dns.Load()
+	if config == nil {
+		return dnsRuntimeConfiguration{AllowPatterns: []string{"*"}}
+	}
+
+	cloned := *config
+	cloned.AllowPatterns = append([]string(nil), cloned.AllowPatterns...)
+	return cloned
+}
+
+func (t *egressConfiguration) InternetEnabled() bool {
+	return t.internetEnabled.Load()
+}
+
+func (t *egressConfiguration) DNSAllowPatterns() []string {
+	return t.dnsConfig().AllowPatterns
+}
+
+func (t *egressConfiguration) SetInternetEnabled(enabled *bool) {
+	if enabled == nil {
+		return
+	}
+
+	t.internetEnabled.Store(*enabled)
+}
+
+func (t *egressConfiguration) SetDNSConfig(allowHostnames []string) error {
+	config := t.dnsConfig()
+	if allowHostnames != nil {
+		config.AllowPatterns = normalizeDNSAllowPatterns(allowHostnames)
+	}
+
+	t.dns.Store(&config)
 	return nil
 }
 
@@ -455,7 +517,13 @@ func (s *ingressServer) handlePut(conn net.Conn, req *http.Request) {
 	}
 
 	var payload struct {
-		Port int `json:"port"`
+		Port     *int `json:"port,omitempty"`
+		Internet *struct {
+			Enabled *bool `json:"enabled,omitempty"`
+		} `json:"internet,omitempty"`
+		DNS *struct {
+			AllowHostnames []string `json:"allowHostnames,omitempty"`
+		} `json:"dns,omitempty"`
 	}
 
 	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
@@ -467,16 +535,46 @@ func (s *ingressServer) handlePut(conn net.Conn, req *http.Request) {
 		return
 	}
 
-	if err := s.egress.SetPort(payload.Port); err != nil {
+	if payload.Port == nil && payload.Internet == nil && payload.DNS == nil {
 		if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(conn); err != nil {
-			log.Println("error writing invalid port response:", err)
+			log.Println("error writing empty put response:", err)
 		}
 
-		log.Println("error updating egress configuration:", err)
+		log.Println("error updating egress configuration: empty payload")
 		return
 	}
 
-	log.Println("updated shared egress port to", payload.Port)
+	if payload.Port != nil {
+		if err := s.egress.SetPort(*payload.Port); err != nil {
+			if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(conn); err != nil {
+				log.Println("error writing invalid port response:", err)
+			}
+
+			log.Println("error updating egress configuration:", err)
+			return
+		}
+
+		log.Println("updated shared egress port to", *payload.Port)
+	}
+
+	if payload.Internet != nil {
+		s.egress.SetInternetEnabled(payload.Internet.Enabled)
+		log.Println("updated shared internet configuration")
+	}
+
+	if payload.DNS != nil {
+		if err := s.egress.SetDNSConfig(payload.DNS.AllowHostnames); err != nil {
+			if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(conn); err != nil {
+				log.Println("error writing invalid dns response:", err)
+			}
+
+			log.Println("error updating dns configuration:", err)
+			return
+		}
+
+		log.Println("updated shared dns configuration")
+	}
+
 	if err := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusNoContent}).Write(conn); err != nil {
 		log.Println("error writing put success response:", err)
 	}
@@ -526,7 +624,6 @@ func peekSNI(r *bufio.Reader) string {
 	// waiting for more bytes that may never arrive.
 	first, err := r.Peek(1)
 	if err != nil {
-		log.Println("debug: peek for TLS detection failed:", err)
 		return ""
 	}
 
@@ -540,7 +637,6 @@ func peekSNI(r *bufio.Reader) string {
 
 	header, err := r.Peek(tlsRecordHeaderLen)
 	if err != nil {
-		log.Println("debug: peek for TLS record header failed:", err)
 		return ""
 	}
 
@@ -548,16 +644,117 @@ func peekSNI(r *bufio.Reader) string {
 	peekLen := min(r.Size(), tlsRecordHeaderLen+recordLen)
 	record, err := r.Peek(peekLen)
 	if err != nil {
-		log.Println("debug: peek for TLS ClientHello failed:", err)
 		return ""
 	}
 
 	sni, err := extractSNI(record)
 	if err != nil {
-		log.Println("debug: SNI extraction failed:", err)
+		return ""
 	}
 
 	return sni
+}
+
+const maxPeekedHTTPHeaderBytes = 128 * 1024
+
+var errPeekedHTTPHeadersTooLarge = errors.New("peeked http headers exceed 128KiB")
+var errNotHTTP = errors.New("not an http request")
+
+func readHostname(r *bufio.Reader) (string, io.Reader, error) {
+	var captured bytes.Buffer
+	var chunk [4096]byte
+	firstLineChecked := false
+
+	for {
+		remaining := maxPeekedHTTPHeaderBytes - captured.Len()
+		if remaining <= 0 {
+			replayReader := io.MultiReader(bytes.NewReader(captured.Bytes()), r)
+			return "", replayReader, errPeekedHTTPHeadersTooLarge
+		}
+
+		readSize := len(chunk)
+		readSize = min(remaining, readSize)
+		n, err := r.Read(chunk[:readSize])
+		if err != nil {
+			replayReader := io.MultiReader(bytes.NewReader(captured.Bytes()), r)
+			return "", replayReader, err
+		}
+
+		captured.Write(chunk[:n])
+		capturedBytes := captured.Bytes()
+
+		if !firstLineChecked {
+			if !looksLikeHTTPRequestPrefix(capturedBytes) {
+				replayReader := io.MultiReader(bytes.NewReader(capturedBytes), r)
+				return "", replayReader, errNotHTTP
+			}
+
+			if bytes.Contains(capturedBytes, []byte("\r\n")) {
+				firstLineChecked = true
+			}
+		}
+
+		if bytes.Contains(capturedBytes, []byte("\r\n\r\n")) {
+			break
+		}
+	}
+
+	capturedBytes := captured.Bytes()
+	replayReader := io.MultiReader(bytes.NewReader(capturedBytes), r)
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(capturedBytes)))
+	if err != nil {
+		return "", replayReader, err
+	}
+
+	return req.Host, replayReader, nil
+}
+
+func looksLikeHTTPRequestLine(line []byte) bool {
+	for _, method := range [...]string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodConnect,
+		http.MethodOptions,
+		http.MethodTrace,
+	} {
+		if bytes.HasPrefix(line, []byte(method+" ")) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func looksLikeHTTPRequestPrefix(prefix []byte) bool {
+	for _, method := range [...]string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodConnect,
+		http.MethodOptions,
+		http.MethodTrace,
+	} {
+		methodPrefix := []byte(method + " ")
+		if len(prefix) <= len(methodPrefix) {
+			if bytes.HasPrefix(methodPrefix, prefix) {
+				return true
+			}
+			continue
+		}
+
+		if bytes.HasPrefix(prefix, methodPrefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
@@ -580,10 +777,26 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 				defer wg.Wait()
 
 				var sni string
-				var containerBuf *bufio.Reader
+				var hostname string
+				containerBuf := bufio.NewReaderSize(containerConnection, 4096)
+				var containerReader io.Reader = containerConnection
 				if p.tlsFactory != nil {
-					containerBuf = bufio.NewReaderSize(containerConnection, 4096)
+					containerReader = containerBuf
 					sni = peekSNI(containerBuf)
+				}
+
+				if sni == "" && dstAddr.Port == 80 {
+					var hostnameErr error
+					hostname, containerReader, hostnameErr = readHostname(containerBuf)
+					if errors.Is(hostnameErr, errNotHTTP) {
+						hostnameErr = nil
+					}
+
+					if hostnameErr != nil {
+						log.Println("error: hostname extraction failed:", hostnameErr)
+						rstTCPConnection(containerConnection)
+						return
+					}
 				}
 
 				originConnection, shouldDecryptTLS, err := dialHTTPConnect(
@@ -593,6 +806,7 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 					sourceAddr.String(),
 					p.gatewayAddr(),
 					sni,
+					hostname,
 				)
 				if err != nil {
 					if err := rstTCPConnection(containerConnection); err != nil {
@@ -626,7 +840,7 @@ func (p *proxy) run(ctx context.Context, wg *sync.WaitGroup) {
 				} else if containerBuf != nil {
 					containerRW = &bufioNetConn{
 						closeReadWriter: containerConnection,
-						reader:          containerBuf,
+						reader:          containerReader,
 					}
 				}
 
@@ -762,6 +976,26 @@ func entrypoint(ctx context.Context) {
 			newProxy(ctx, proxyAnythingAddressV6TCP, egressIP, egressConfig, tlsFactory))
 	}
 
+	var dnsProxyV4 *dnsProxy
+	if *dnsEnabled {
+		dnsAddr, err := net.ResolveUDPAddr("udp4", *dnsProxyAddress)
+		if err != nil {
+			fatal(fmt.Errorf("resolving dns addr: %w", err))
+		}
+
+		dnsProxyV4 = newDNSProxy(ctx, dnsAddr, egressConfig)
+	}
+
+	var dnsProxyV6 *dnsProxy
+	if *dnsEnabled && !*disableIPv6 {
+		dnsAddr, err := net.ResolveUDPAddr("udp6", *dnsProxyV6Address)
+		if err != nil {
+			fatal(fmt.Errorf("resolving dns v6 addr: %w", err))
+		}
+
+		dnsProxyV6 = newDNSProxy(ctx, dnsAddr, egressConfig)
+	}
+
 	fmt.Printf("Proxy address: %s, Port: %d\n", proxyAnythingAddressTCP.IP.String(), proxyAnythingAddressTCP.Port)
 
 	cleanupIptables(ctx)
@@ -776,6 +1010,7 @@ func entrypoint(ctx context.Context) {
 		ipVersion       string
 		ignoreAddresses []string
 		proxy           *proxy
+		dnsProxy        *dnsProxy
 	}
 
 	ipv4Ignored := []string{"127.0.0.1/8", dockerNetwork.String(), egressIP.String() + "/24"}
@@ -790,6 +1025,7 @@ func entrypoint(ctx context.Context) {
 			ipVersion:       "-4",
 			ignoreAddresses: ipv4Ignored,
 			proxy:           proxies[0],
+			dnsProxy:        dnsProxyV4,
 		},
 	}
 
@@ -799,6 +1035,7 @@ func entrypoint(ctx context.Context) {
 			ipVersion:       "-6",
 			ignoreAddresses: ipv6Ignored,
 			proxy:           proxies[1],
+			dnsProxy:        dnsProxyV6,
 		})
 	}
 
@@ -864,11 +1101,42 @@ func entrypoint(ctx context.Context) {
 
 		// flush the cache
 		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "route", "flush", "cache")
+
+		if iptablesSetup.dnsProxy == nil {
+			continue
+		}
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-N", iptablesNamespaceDNSTproxy)
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceDNSTproxy)
+		for _, cidrToIgnore := range iptablesSetup.ignoreAddresses {
+			mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNSTproxy, "-d", cidrToIgnore, "-j", "RETURN")
+		}
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNSTproxy, "-m", "mark", "-p", "udp", "--mark", strconv.Itoa(dnsBypassMark), "-j", "RETURN")
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNSTproxy, "-p", "udp", "--dport", "53", "-j", "TPROXY", "--tproxy-mark", "0x1/0x1", "--on-port",
+			strconv.Itoa(iptablesSetup.dnsProxy.addr.Port), "--on-ip", iptablesSetup.dnsProxy.addr.IP.String())
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesNamespaceDNSTproxy)
+
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-N", iptablesNamespaceDNS)
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-F", iptablesNamespaceDNS)
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNS, "-p", "udp", "-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN")
+		for _, cidrToIgnore := range iptablesSetup.ignoreAddresses {
+			mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNS, "-d", cidrToIgnore, "-j", "RETURN")
+		}
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNS, "-m", "mark", "-p", "udp", "--mark", strconv.Itoa(dnsBypassMark), "-j", "RETURN")
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", iptablesNamespaceDNS, "-p", "udp", "--dport", "53", "-j", "MARK", "--set-mark", "1")
+		mustRunCommand(ctx, iptables, "-t", "mangle", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesNamespaceDNS)
+		mustRunCommand(ctx, "ip", iptablesSetup.ipVersion, "route", "flush", "cache")
 	}
 
 	wg := &sync.WaitGroup{}
 	for _, proxy := range proxies {
 		defer proxy.Close()
+	}
+	if dnsProxyV4 != nil {
+		defer dnsProxyV4.Close()
+	}
+	if dnsProxyV6 != nil {
+		defer dnsProxyV6.Close()
 	}
 	if ingressServer != nil {
 		defer ingressServer.Close()
@@ -877,6 +1145,12 @@ func entrypoint(ctx context.Context) {
 	defer wg.Wait()
 	for _, proxy := range proxies {
 		proxy.run(ctx, wg)
+	}
+	if dnsProxyV4 != nil {
+		dnsProxyV4.run(ctx, wg)
+	}
+	if dnsProxyV6 != nil {
+		dnsProxyV6.run(ctx, wg)
 	}
 
 	if ingressServer != nil {
