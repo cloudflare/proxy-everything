@@ -150,32 +150,18 @@ func (p *dnsProxy) handlePacket(ctx context.Context, sourceAddr *net.UDPAddr, or
 		response, err := p.forwardToOriginal(ctx, originalDst, payload)
 		if err != nil {
 			log.Println("error dialing DNS:", err)
-			return
-		}
-
-		rcode, rcodeErr := dnsResponseRcode(response)
-
-		// If NXDOMAIN, but we should allow this domain, fake the response
-		if rcodeErr == nil && rcode == dns.RcodeNameError && allowed {
-			allowedResponse, packErr := dnsAllowedResponse(request)
-			if packErr != nil {
-				log.Println("error packing allowed nxdomain fallback response:", packErr)
+			if !allowed {
 				return
 			}
-
-			if err := p.replyToClient(ctx, sourceAddr, originalDst, allowedResponse); err != nil {
-				log.Println("error replying allowed nxdomain fallback response:", err)
+		} else {
+			rcode, rcodeErr := dnsResponseRcode(response)
+			if rcodeErr != nil || rcode != dns.RcodeNameError || !allowed {
+				if err := p.replyToClient(ctx, sourceAddr, originalDst, response); err != nil {
+					log.Println("error replying dns upstream response:", err)
+				}
+				return
 			}
-
-			return
 		}
-
-		// Just reply to client with original response
-		if err := p.replyToClient(ctx, sourceAddr, originalDst, response); err != nil {
-			log.Println("error replying dns upstream response:", err)
-		}
-
-		return
 	}
 
 	// If not allowed, and internet disabled, just NXDOMAIN

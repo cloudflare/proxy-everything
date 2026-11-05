@@ -190,6 +190,7 @@ Behavior:
 
 - If `internet.enabled=true`, intercepted DNS queries are forwarded to the original resolver and the upstream response is normally relayed unchanged.
 - If the upstream response is `NXDOMAIN` and the queried hostname matches `dns.allowHostnames`, the proxy synthesizes a fallback answer instead of returning `NXDOMAIN`.
+- If the upstream resolver is unavailable, matching hostnames also get a fallback answer. Non-matching queries remain unanswered.
 - If `internet.enabled=false`, the query is handled locally: matching hostnames get a fallback answer and non-matching hostnames get `NXDOMAIN`.
 - Fallback answers are currently `11.0.0.1` for `A` queries and `fd00::1` for `AAAA` queries.
 
