@@ -31,6 +31,9 @@ func TestDNSProxyRetainsUpstreamResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer resolver.Close()
+			if err := resolver.SetReadDeadline(time.Now().Add(dnsUpstreamTimeout)); err != nil {
+				t.Fatal(err)
+			}
 			request := new(dns.Msg).SetQuestion("backups.sandbox.internal.", dns.TypeA)
 			payload, err := request.Pack()
 			if err != nil {
@@ -120,26 +123,30 @@ func TestDNSProxyUnavailableResolver(t *testing.T) {
 			proxy := &dnsProxy{config: config}
 			proxy.handlePacket(t.Context(), client.LocalAddr().(*net.UDPAddr), resolverAddress, payload)
 
-			raw, err := client.SyscallConn()
-			if err != nil {
-				t.Fatal(err)
-			}
 			buffer := make([]byte, 512)
-			var n int
-			var receiveError error
-			if err := raw.Control(func(fd uintptr) {
-				n, _, receiveError = syscall.Recvfrom(int(fd), buffer, syscall.MSG_DONTWAIT)
-			}); err != nil {
-				t.Fatal(err)
-			}
 			if !test.answer {
+				raw, err := client.SyscallConn()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var n int
+				var receiveError error
+				if err := raw.Control(func(fd uintptr) {
+					n, _, receiveError = syscall.Recvfrom(int(fd), buffer, syscall.MSG_DONTWAIT)
+				}); err != nil {
+					t.Fatal(err)
+				}
 				if !errors.Is(receiveError, syscall.EAGAIN) {
 					t.Fatalf("unmatched query received a reply: bytes=%d error=%v", n, receiveError)
 				}
 				return
 			}
-			if receiveError != nil {
-				t.Fatalf("intercepted query received no fallback: %v", receiveError)
+			if err := client.SetReadDeadline(time.Now().Add(dnsUpstreamTimeout)); err != nil {
+				t.Fatal(err)
+			}
+			n, _, err := client.ReadFromUDP(buffer)
+			if err != nil {
+				t.Fatalf("intercepted query received no fallback: %v", err)
 			}
 			response := new(dns.Msg)
 			if err := response.Unpack(buffer[:n]); err != nil {
