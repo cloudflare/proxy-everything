@@ -413,6 +413,21 @@ func (s *ingressServer) handleConnect(ctx context.Context, clientConn net.Conn, 
 		return
 	}
 
+	switch protocol := req.Header.Get("X-Dst-Protocol"); protocol {
+	case "":
+		// absent means TCP
+	case "udp":
+		s.handleConnectUDP(ctx, clientConn, reader, targetAddr)
+		return
+	default:
+		if writeErr := (&http.Response{ProtoMajor: 1, ProtoMinor: 1, StatusCode: http.StatusBadRequest}).Write(clientConn); writeErr != nil {
+			log.Println("error writing unknown protocol response:", writeErr)
+		}
+
+		log.Println("error: unknown ingress protocol", protocol)
+		return
+	}
+
 	originConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
 	response := http.Response{ProtoMajor: 1, ProtoMinor: 1}
 	if err != nil {

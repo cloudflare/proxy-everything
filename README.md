@@ -158,6 +158,8 @@ If the flag is empty, no ingress listener is started.
 - `CONNECT` requests are accepted on that listener.
 - `X-Dst-Addr` must contain the full destination as `IP:port`.
 - If the destination port is closed, the listener returns `400`.
+- `X-Dst-Protocol: udp` opens one UDP flow to `X-Dst-Addr` instead of a TCP connection. See "UDP ingress".
+  Without the header the connection is TCP; any other value returns `400`.
 - `GET /ca` returns the PEM-encoded CA certificate (`/ca/ca.crt`). Only useful when `-tls-intercept` is enabled. Returns `404` if the certificate doesn't exist.
 - `PUT /egress` updates shared runtime configuration. Supported fields are:
   - `port` -- updates `http-egress-port`
@@ -178,9 +180,35 @@ curl -v -x http://127.0.0.1:49122 https://ignored.example \
   -H 'X-Dst-Addr: 172.17.0.1:8443'
 ```
 
+# UDP ingress
+
+The ingress listener relays one UDP flow per connection. Request:
+
+```
+CONNECT 127.0.0.1:<port> HTTP/1.1
+Host: 127.0.0.1:<port>
+X-Dst-Addr: 127.0.0.1:<port>
+X-Dst-Protocol: udp
+```
+
+`X-Dst-Addr` is validated as for TCP and must be an IPv4 `IP:port`; otherwise the listener returns `400`.
+On success it answers `200` exactly as for TCP. UDP has no handshake, so a port with nothing listening
+still gets `200`.
+
+After the request head (bytes may follow it without waiting for `200`), both directions carry frames:
+a 2-byte big-endian length `L` from 0 to 1500, then `L` bytes of one datagram.
+
+- Datagrams over 1500 bytes from the container are dropped. Empty datagrams are valid.
+- Frames toward the container with a length from 1501 to `0xFFFE` are skipped and the flow stays open, so
+  the limit can be raised later without negotiation. A length of `0xFFFF` is a protocol error that closes the flow.
+- ICMP port unreachable does not end the flow; the application may bind the port later.
+- Half-close is not used: EOF or an error in either direction ends the flow, and the listener closes the
+  connection and the UDP socket. There is no idle timeout.
+- Under backpressure datagrams are dropped at the UDP socket, not buffered.
+
 # DNS interception
 
-UDP interception is currently limited to DNS on port `53` and is optional.
+UDP egress interception is currently limited to DNS on port `53` and is optional.
 
 - Pass `-dns-enabled` to enable DNS interception.
 - `-dns-address` controls the IPv4 transparent DNS listener address. Default: `127.0.0.9:5000`.
@@ -199,7 +227,7 @@ Behavior:
 3. HTTP CONNECT everything.
 
 # Current limitations
-1. UDP support is currently limited to DNS on port `53`.
+1. UDP egress is currently limited to DNS on port `53`. UDP ingress is IPv4 only.
 2. Proxying to unix sockets is not implemented yet due to lack of support on MacOS.
 
 # TLDR: How?
