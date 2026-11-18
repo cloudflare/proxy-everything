@@ -1,0 +1,50 @@
+name: Test
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    name: go-test
+    # A pull request from a branch of this repository is already tested by its push.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Each failure is repeated as an annotation: job logs need admin rights, annotations are public.
+      - name: gofmt
+        run: |
+          if ! test -z "$(gofmt -l .)"; then
+            gofmt -l .
+            gofmt -d . > gofmt.diff || true
+            cat gofmt.diff
+            echo "::error title=gofmt::$(head -n 150 gofmt.diff | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+            exit 1
+          fi
+      - name: go vet
+        run: |
+          if ! go vet ./... > vet.log 2>&1; then
+            cat vet.log
+            echo "::error title=go vet::$(head -n 150 vet.log | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+            exit 1
+          fi
+      - name: go test
+        run: |
+          if ! go test -race -count=1 ./... > test.log 2>&1; then
+            cat test.log
+            echo "::error title=go test::$(head -n 150 test.log | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+            exit 1
+          fi
+
+          cat test.log
